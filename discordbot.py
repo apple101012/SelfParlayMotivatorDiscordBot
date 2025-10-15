@@ -1,6 +1,8 @@
 # discordbot.py
 import os, logging, asyncio
 from datetime import datetime, timedelta
+from storage import today_str  # add this import at the top with your other storage imports if it's not already there
+
 from zoneinfo import ZoneInfo
 
 import discord
@@ -59,6 +61,40 @@ async def ensure_dm(interaction: discord.Interaction) -> bool:
     return False
 
 # ----- COMMANDS -----
+@bot.tree.command(name="resetdaily", description="Manually reset your daily stake cap")
+async def resetdaily(interaction: discord.Interaction):
+    # DM only
+    if not await ensure_dm(interaction):
+        return
+
+    uid = str(interaction.user.id)
+
+    async with DB_LOCK:
+        ensure_user(uid)
+        user = DB["users"][uid]
+        # reset the daily counters in-place
+        user["daily_spent"] = 0
+        user["daily_date"] = today_str()  # mark “today” so daily_weekly_ok won’t immediately reset again
+        save_data()
+
+    await interaction.response.send_message("Your daily stake usage has been reset to 0.", ephemeral=False)
+
+@bot.tree.command(name="resetweekly", description="Manually reset your weekly stake cap")
+async def resetweekly(interaction: discord.Interaction):
+    if not await ensure_dm(interaction):
+        return
+
+    uid = str(interaction.user.id)
+
+    async with DB_LOCK:
+        ensure_user(uid)
+        user = DB["users"][uid]
+        user["weekly_spent"] = 0
+        # keep the same week key; weekly cap logic will roll over naturally on next week
+        save_data()
+
+    await interaction.response.send_message("Your weekly stake usage has been reset to 0.", ephemeral=False)
+
 @bot.tree.command(name="rules", description="How this DM self-parlay bot works.")
 async def rules(interaction: discord.Interaction):
     if not await ensure_dm(interaction): return
@@ -152,6 +188,7 @@ async def parlays(interaction: discord.Interaction):
             p.channel_id = msg.channel.id
             DB["parlays"][p.id] = p.to_dict()
             save_data()
+
 
 @bot.tree.command(name="bank", description="Show your balance, caps, streak, last 5 results + next daily reset.")
 async def bank(interaction: discord.Interaction):
