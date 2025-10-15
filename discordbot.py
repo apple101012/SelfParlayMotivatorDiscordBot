@@ -1,18 +1,21 @@
-# self_parlay_bot.py
-# Minimal "Self-Parlay" Discord bot — JSON storage, no SQL.
-# Python 3.10+ recommended (uses zoneinfo). Requires: pip install discord.py
+# self_parlay_dm_bot.py
+# DM-only "Self-Parlay" Discord bot — JSON storage, no SQL.
+# Python 3.10+ recommended. Requires: pip install discord.py python-dotenv
 
 import os
 import json
 import asyncio
 import uuid
-from dataclasses import dataclass, asdict, field
-from datetime import datetime, timedelta, date
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
 from discord.ext import tasks
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # ========= CONFIG =========
 DATA_FILE = "selfparlay_data.json"
@@ -84,7 +87,7 @@ class Parlay:
     deadline_ts: str  # ISO (ET)
     status: str = "ACTIVE"  # ACTIVE | WON | LOST
     message_id: int | None = None
-    channel_id: int | None = None
+    channel_id: int | None = None  # DM channel id
     resolved_ts: str | None = None
 
     def to_dict(self):
@@ -116,7 +119,6 @@ def parse_deadline(deadline_str: str) -> datetime:
     """
     Accepts format like "10/14/2025 11:59 PM" in America/New_York.
     """
-    # strict, simple format — avoids external libs
     deadline_str = deadline_str.strip()
     try:
         dt_naive = datetime.strptime(deadline_str, "%m/%d/%Y %I:%M %p")
@@ -132,7 +134,7 @@ def parse_legs(legs_str: str) -> list[str]:
     buf, in_paren = [], False
     for ch in legs_str:
         if ch == "(":
-            if in_paren:  # nested not allowed
+            if in_paren:
                 raise ValueError("Nested parentheses not allowed.")
             in_paren = True
             buf = []
@@ -214,20 +216,18 @@ def add_ledger(user_id: str, delta: int, parlay_id: str, note: str):
         "ts": datetime.now(TZ).isoformat()
     })
 
-async def resolve_parlay(parlay: Parlay, author: discord.User, guild: discord.Guild | None = None):
+async def resolve_parlay(parlay: Parlay, author: discord.User):
     if parlay.status != "ACTIVE":
-        return  # already done
+        return
     user = DB["users"][parlay.user_id]
-    # Determine outcome
     all_done = all(l.status == "WIN" for l in parlay.legs)
     any_fail = any(l.status == "FAIL" for l in parlay.legs)
     deadline = datetime.fromisoformat(parlay.deadline_ts)
 
     if not all_done or any_fail or datetime.now(TZ) > deadline:
-        # LOSS
         user["balance"] -= parlay.stake
         user["last_loss_ts"] = datetime.now(TZ).isoformat()
-        user["streak_days"] = 0  # reset streak
+        user["streak_days"] = 0
         outcome = f"LOSS −{parlay.stake} pts"
         add_ledger(parlay.user_id, -parlay.stake, parlay.id, "Parlay loss")
         parlay.status = "LOST"
@@ -244,10 +244,10 @@ async def resolve_parlay(parlay: Parlay, author: discord.User, guild: discord.Gu
 
     parlay.resolved_ts = datetime.now(TZ).isoformat()
 
-    # Post/update the embed & a ledger note
+    # Edit the DM embed + send a short ledger DM
     try:
-        if parlay.channel_id and parlay.message_id and guild:
-            ch = guild.get_channel(parlay.channel_id) or await guild.fetch_channel(parlay.channel_id)
+        if parlay.channel_id and parlay.message_id:
+            ch = bot.get_channel(parlay.channel_id) or await bot.fetch_channel(parlay.channel_id)
             msg = await ch.fetch_message(parlay.message_id)
             await msg.edit(embed=make_embed(parlay, author), view=None)
             await ch.send(f"**Parlay #{parlay.id.split('-')[0]}** → {outcome} • New balance: **{user['balance']} pts**")
@@ -257,7 +257,7 @@ async def resolve_parlay(parlay: Parlay, author: discord.User, guild: discord.Gu
 # ========= DISCORD BOT =========
 
 intents = discord.Intents.default()
-intents.message_content = False
+intents.message_content = False  # slash commands don't need message content
 
 class SelfParlayBot(discord.Client):
     def __init__(self):
@@ -265,17 +265,27 @@ class SelfParlayBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self) -> None:
-        # Sync commands (optionally to a single guild for fast dev)
-        guild_id = os.getenv("GUILD_ID")
-        if guild_id:
-            guild = discord.Object(id=int(guild_id))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-        else:
-            await self.tree.sync()
+        # Global sync so commands work in DMs
+        await self.tree.sync()
         deadline_watcher.start()
 
 bot = SelfParlayBot()
+
+# ========= DM-ONLY GUARD =========
+
+async def ensure_dm(interaction: discord.Interaction) -> bool:
+    """True if in DM; if used in a server, nudge + DM instructions, then return False."""
+    if interaction.guild is None:
+        return True
+    try:
+        await interaction.response.send_message("Use me in **DMs**. I DM’d you instructions.", ephemeral=True)
+    except discord.InteractionResponded:
+        pass
+    try:
+        await interaction.user.send("Hi! I work only in DMs. Try `/rules` here first, then `/bet`.")
+    except Exception:
+        pass
+    return False
 
 # ========= VIEWS (Buttons) =========
 
@@ -285,17 +295,23 @@ class ManageParlayView(discord.ui.View):
         self.parlay_id = parlay.id
         self.author_id = author_id
 
-        # Add leg selection dropdowns only if ACTIVE
         if parlay.status == "ACTIVE":
             self.add_item(CompleteLegSelect(parlay))
             self.add_item(FailLegSelect(parlay))
-        # Resolve button: enabled only if all legs WIN
         all_done = all(l.status == "WIN" for l in parlay.legs)
         self.add_item(ResolveNowButton(enabled=all_done))
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.author_id:
             await interaction.response.send_message("Only the bet creator can manage this parlay.", ephemeral=True)
+            return False
+        # DM only
+        if interaction.guild is not None:
+            await interaction.response.send_message("I only work in **DMs**. I DM’d you instructions.", ephemeral=True)
+            try:
+                await interaction.user.send("Open our DM and use `/bet`, `/bank`, `/parlays` here.")
+            except Exception:
+                pass
             return False
         return True
 
@@ -305,7 +321,8 @@ class CompleteLegSelect(discord.ui.Select):
         for idx, leg in enumerate(parlay.legs, start=1):
             if leg.status == "OPEN":
                 options.append(discord.SelectOption(label=f"✅ Complete leg {idx}", description=leg.text, value=str(idx)))
-        super().__init__(placeholder="Mark a leg as COMPLETE", min_values=1, max_values=1, options=options, row=0)
+        placeholder = "Mark a leg as COMPLETE" if options else "No open legs"
+        super().__init__(placeholder=placeholder, min_values=1 if options else 0, max_values=1 if options else 0, options=options, row=0)
 
     async def callback(self, interaction: discord.Interaction):
         async with DB_LOCK:
@@ -320,7 +337,6 @@ class CompleteLegSelect(discord.ui.Select):
             save_data()
 
         embed = make_embed(parlay, interaction.user)
-        # Rebuild view with updated state
         view = ManageParlayView(parlay, interaction.user.id)
         await interaction.response.edit_message(embed=embed, view=view)
 
@@ -330,7 +346,8 @@ class FailLegSelect(discord.ui.Select):
         for idx, leg in enumerate(parlay.legs, start=1):
             if leg.status == "OPEN":
                 options.append(discord.SelectOption(label=f"❌ Fail leg {idx}", description=leg.text, value=str(idx)))
-        super().__init__(placeholder="Mark a leg as FAIL", min_values=1, max_values=1, options=options, row=1)
+        placeholder = "Mark a leg as FAIL" if options else "No open legs"
+        super().__init__(placeholder=placeholder, min_values=1 if options else 0, max_values=1 if options else 0, options=options, row=1)
 
     async def callback(self, interaction: discord.Interaction):
         async with DB_LOCK:
@@ -357,12 +374,10 @@ class ResolveNowButton(discord.ui.Button):
             parlay = Parlay.from_dict(DB["parlays"][self.view.parlay_id])
             if parlay.status != "ACTIVE":
                 return await interaction.response.send_message("Parlay already resolved.", ephemeral=True)
-            # Must be all WIN to resolve early
             if not all(l.status == "WIN" for l in parlay.legs):
                 return await interaction.response.send_message("All legs must be ✅ to resolve early.", ephemeral=True)
             author = interaction.user
-            guild = interaction.guild
-            await resolve_parlay(parlay, author, guild)
+            await resolve_parlay(parlay, author)
             DB["parlays"][parlay.id] = parlay.to_dict()
             save_data()
 
@@ -371,46 +386,76 @@ class ResolveNowButton(discord.ui.Button):
 
 # ========= COMMANDS =========
 
-@bot.tree.command(name="bet", description="Create a parlay: /bet <stake> <legs> <deadline>")
+@bot.tree.command(name="rules", description="How this DM self-parlay bot works.")
+async def rules(interaction: discord.Interaction):
+    if not await ensure_dm(interaction):
+        return
+    e = discord.Embed(title="Self-Parlay Rules (DM Bot)", color=0x43B581, timestamp=datetime.now(TZ))
+    e.add_field(name="What is this?", value="A simple, manual **bet-on-yourself** game. Create a parlay (1–5 tasks), set a deadline, mark legs ✅/❌, then resolve.", inline=False)
+    e.add_field(name="Create a parlay", value="`/bet 50 (go to gym) (study 40 mins) (finish 310 hw) 10/14/2025 11:59 PM`", inline=False)
+    e.add_field(name="See your parlays", value="`/parlays` — lists active ones (jump links).", inline=False)
+    e.add_field(name="Your bank", value="`/bank` — balance, streak, recent results.", inline=False)
+    e.add_field(name="Win/Loss", value="Win only if **all legs** are ✅ by the deadline. Else it’s a loss.", inline=False)
+    e.add_field(name="Payouts", value="Multiplier by leg count: 1→1.20, 2→1.50, 3→1.80, 4→2.00, 5→2.20.", inline=False)
+    e.add_field(name="Caps & Cooldown", value=f"Daily cap {DAILY_STAKE_CAP} pts, weekly cap {WEEKLY_STAKE_CAP} pts. After a loss: {COOLDOWN_AFTER_LOSS_MIN} min cooldown.", inline=False)
+    e.set_footer(text="All times are ET • Keep it healthy. This is about progress, not gambling.")
+    await interaction.response.send_message(embed=e)
+
+@bot.tree.command(name="faq", description="Quick FAQ / tips.")
+async def faq(interaction: discord.Interaction):
+    if not await ensure_dm(interaction):
+        return
+    e = discord.Embed(title="FAQ", color=0x7289DA, timestamp=datetime.now(TZ))
+    e.add_field(name="Where do I use commands?", value="**DMs only.**", inline=False)
+    e.add_field(name="How do I mark progress?", value="Use the buttons on your parlay embed in DM to mark legs ✅ or ❌.", inline=False)
+    e.add_field(name="Can I edit a parlay?", value="No edits. Create carefully. You can create a new one.", inline=False)
+    e.add_field(name="What happens at deadline?", value="If any leg isn’t ✅, it resolves as a loss automatically.", inline=False)
+    e.add_field(name="What if I misclicked?", value="Keep it honest. If it was a genuine mistake, you can create a new parlay tomorrow.", inline=False)
+    e.set_footer(text="Use /rules for full details • /bet to start")
+    await interaction.response.send_message(embed=e)
+
+@bot.tree.command(name="bet", description="Create a parlay in DM: /bet <stake> <legs> <deadline>")
 @app_commands.describe(
     stake="Points to stake (integer)",
     legs_text="Legs in parentheses, e.g. (go gym) (study 40 mins) (finish 310 hw)",
     deadline="Deadline in ET, e.g. 10/14/2025 11:59 PM"
 )
 async def bet(interaction: discord.Interaction, stake: app_commands.Range[int, 1, 100000], legs_text: str, deadline: str):
-    await interaction.response.defer(ephemeral=True, thinking=True)
+    # DM-only
+    if not await ensure_dm(interaction):
+        return
+
     uid = str(interaction.user.id)
     now = datetime.now(TZ)
 
     try:
         legs_list = parse_legs(legs_text)
         if not legs_list:
-            return await interaction.followup.send("Please include at least one leg in `( ... )`.", ephemeral=True)
+            return await interaction.response.send_message("Include at least one leg in `( ... )`.")
         if len(legs_list) > MAX_LEGS:
-            return await interaction.followup.send(f"Max {MAX_LEGS} legs allowed.", ephemeral=True)
+            return await interaction.response.send_message(f"Max {MAX_LEGS} legs allowed.")
 
         deadline_dt = parse_deadline(deadline)
         if deadline_dt <= now:
-            return await interaction.followup.send("Deadline must be in the future.", ephemeral=True)
+            return await interaction.response.send_message("Deadline must be in the future.")
     except ValueError as e:
-        return await interaction.followup.send(f"Error: {e}", ephemeral=True)
+        return await interaction.response.send_message(f"Error: {e}")
 
     async with DB_LOCK:
         ensure_user(uid)
         user = DB["users"][uid]
 
-        # Cooldown after loss
+        # cooldown / caps
         if user["last_loss_ts"]:
             last_loss = datetime.fromisoformat(user["last_loss_ts"])
             if now - last_loss < timedelta(minutes=COOLDOWN_AFTER_LOSS_MIN):
                 wait_m = int((timedelta(minutes=COOLDOWN_AFTER_LOSS_MIN) - (now - last_loss)).total_seconds() // 60) + 1
-                return await interaction.followup.send(f"Cooldown after loss. Try again in ~{wait_m} minutes.", ephemeral=True)
-
+                return await interaction.response.send_message(f"Cooldown after loss. Try again in ~{wait_m} minutes.")
         ok, msg = daily_weekly_ok(user, stake, now)
         if not ok:
-            return await interaction.followup.send(msg, ephemeral=True)
+            return await interaction.response.send_message(msg)
 
-        # Create parlay
+        # create parlay
         legs = [Leg(text=t) for t in legs_list]
         legs_count = len(legs)
         multiplier = PARLAY_MULT.get(legs_count, PARLAY_MULT[MAX_LEGS])
@@ -426,60 +471,51 @@ async def bet(interaction: discord.Interaction, stake: app_commands.Range[int, 1
             deadline_ts=deadline_dt.isoformat(),
         )
         DB["parlays"][pid] = parlay.to_dict()
-
-        # consume caps immediately (stake reserved)
-        # (we count against caps when creating; balance only changes on resolve)
-        # reset daily/weekly counters if needed (handled in daily_weekly_ok)
         user["daily_spent"] += stake
         user["weekly_spent"] += stake
-
         save_data()
 
-    # Post the parlay embed in current channel
+    # reply in this DM with the embed + buttons
     embed = make_embed(parlay, interaction.user)
     view = ManageParlayView(parlay, interaction.user.id)
-    ch = interaction.channel
-    msg = await ch.send(embed=embed, view=view)
+    await interaction.response.send_message(embed=embed, view=view)
 
-    # Store message/channel for jump link & edits
+    # store the message we just sent to enable later edits
+    msg = await interaction.original_response()
     async with DB_LOCK:
         parlay.message_id = msg.id
         parlay.channel_id = msg.channel.id
         DB["parlays"][parlay.id] = parlay.to_dict()
         save_data()
 
-    await interaction.followup.send(
-        f"Parlay created: **{parlay.legs_count} legs @ {parlay.multiplier:.2f}×**. "
-        f"[Jump to message]({msg.jump_url})",
-        ephemeral=True
-    )
-
-@bot.tree.command(name="parlays", description="List your active parlays and jump to them.")
+@bot.tree.command(name="parlays", description="List your active parlays (DM).")
 async def parlays(interaction: discord.Interaction):
+    if not await ensure_dm(interaction):
+        return
     uid = str(interaction.user.id)
     async with DB_LOCK:
         user_parlays = [Parlay.from_dict(p) for p in DB["parlays"].values() if p["user_id"] == uid and p["status"] == "ACTIVE"]
 
     if not user_parlays:
-        return await interaction.response.send_message("You have no active parlays.", ephemeral=True)
+        return await interaction.response.send_message("You have no active parlays.")
 
-    # Sort by deadline soonest
     user_parlays.sort(key=lambda p: p.deadline_ts)
     lines = []
     for p in user_parlays[:10]:
-        jump = f"https://discord.com/channels/{interaction.guild_id}/{p.channel_id}/{p.message_id}" if p.channel_id and p.message_id else "(no link)"
+        jump = f"https://discord.com/channels/@me/{p.channel_id}/{p.message_id}" if p.channel_id and p.message_id else "(no link)"
         deadline = datetime.fromisoformat(p.deadline_ts).strftime("%b %d, %Y %I:%M %p")
         lines.append(f"• **#{p.id.split('-')[0]}** — {p.legs_count} legs @ {p.multiplier:.2f}× — Stake {p.stake} — Deadline {deadline} — [open]({jump})")
 
-    await interaction.response.send_message("\n".join(lines), ephemeral=True)
+    await interaction.response.send_message("\n".join(lines))
 
-@bot.tree.command(name="bank", description="Show your balance, streak, and last 5 results.")
+@bot.tree.command(name="bank", description="Show your balance, streak, and last 5 results (DM).")
 async def bank(interaction: discord.Interaction):
+    if not await ensure_dm(interaction):
+        return
     uid = str(interaction.user.id)
     async with DB_LOCK:
         ensure_user(uid)
         user = DB["users"][uid]
-        # recent ledger
         recent = [l for l in reversed(DB["ledger"]) if l["user_id"] == uid][:5]
 
     e = discord.Embed(title="Your Bank", color=0x5865F2, timestamp=datetime.now(TZ))
@@ -493,19 +529,20 @@ async def bank(interaction: discord.Interaction):
         for r in recent:
             sign = "🟢" if r["delta"] > 0 else "🔴"
             amt = f"+{r['delta']}" if r["delta"] > 0 else f"{r['delta']}"
-            pretty.append(f"{sign} {amt} • #{r['parlay_id'].split('-')[0]} • {r['note']} • {datetime.fromisoformat(r['ts']).astimezone(TZ).strftime('%m/%d %I:%M %p')}")
+            when = datetime.fromisoformat(r['ts']).astimezone(TZ).strftime('%m/%d %I:%M %p')
+            pretty.append(f"{sign} {amt} • #{r['parlay_id'].split('-')[0]} • {r['note']} • {when}")
         e.add_field(name="Recent", value="\n".join(pretty), inline=False)
     else:
         e.add_field(name="Recent", value="No results yet.", inline=False)
 
     e.set_footer(text="All times ET • Multipliers: 1→1.20, 2→1.50, 3→1.80, 4→2.00, 5→2.20")
-    await interaction.response.send_message(embed=e, ephemeral=True)
+    await interaction.response.send_message(embed=e)
 
 # ========= BACKGROUND DEADLINE WATCHER =========
 
 @tasks.loop(seconds=60)
 async def deadline_watcher():
-    # check all ACTIVE parlays whose deadline passed → auto-resolve as loss unless all legs WIN
+    # Auto-resolve expired ACTIVE parlays in DMs
     async with DB_LOCK:
         active = [Parlay.from_dict(p) for p in DB["parlays"].values() if p["status"] == "ACTIVE"]
     if not active:
@@ -513,47 +550,18 @@ async def deadline_watcher():
     for p in active:
         deadline = datetime.fromisoformat(p.deadline_ts)
         if datetime.now(TZ) >= deadline:
-            # Need guild context to edit messages; loop through all guilds (single-user bot)
-            author_user = None
-            guild_for_msg = None
+            # Resolve for the user in DMs
             try:
-                # Find the guild that has the channel
-                for g in bot.guilds:
-                    if p.channel_id and g.get_channel(p.channel_id):
-                        guild_for_msg = g
-                        break
-                if guild_for_msg:
-                    author_user = guild_for_msg.get_member(int(p.user_id)) or await guild_for_msg.fetch_member(int(p.user_id))
+                user = bot.get_user(int(p.user_id)) or await bot.fetch_user(int(p.user_id))
             except Exception:
-                pass
+                user = None
+            if not user:
+                continue
 
             async with DB_LOCK:
-                # Reload latest state to avoid races
                 p_latest = Parlay.from_dict(DB["parlays"][p.id])
-            if author_user and guild_for_msg:
-                await resolve_parlay(p_latest, author_user, guild_for_msg)
-            else:
-                # Resolve without messaging if we can't find guild/user (fallback)
-                user = DB["users"].get(p_latest.user_id)
-                if user:
-                    all_done = all(l.status == "WIN" for l in p_latest.legs)
-                    any_fail = any(l.status == "FAIL" for l in p_latest.legs)
-                    if not all_done or any_fail:
-                        user["balance"] -= p_latest.stake
-                        user["last_loss_ts"] = datetime.now(TZ).isoformat()
-                        user["streak_days"] = 0
-                        add_ledger(p_latest.user_id, -p_latest.stake, p_latest.id, "Parlay loss (auto)")
-                        p_latest.status = "LOST"
-                    else:
-                        payout = round(p_latest.stake * p_latest.multiplier)
-                        user["balance"] += payout
-                        today = today_str()
-                        if user["last_win_date"] != today:
-                            user["streak_days"] = (user.get("streak_days", 0) or 0) + 1
-                            user["last_win_date"] = today
-                        add_ledger(p_latest.user_id, payout, p_latest.id, "Parlay win (auto)")
-                        p_latest.status = "WON"
-                    p_latest.resolved_ts = datetime.now(TZ).isoformat()
+
+            await resolve_parlay(p_latest, user)
 
             async with DB_LOCK:
                 DB["parlays"][p_latest.id] = p_latest.to_dict()
@@ -568,6 +576,6 @@ async def before_deadline_watcher():
 if __name__ == "__main__":
     token = os.getenv("DISCORD_TOKEN")
     if not token:
-        print("Set your bot token in the DISCORD_TOKEN environment variable.")
+        print("Set your bot token in the DISCORD_TOKEN environment variable (use python-dotenv or export it).")
         raise SystemExit(1)
     bot.run(token)
